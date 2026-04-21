@@ -131,56 +131,130 @@
     });
   }
 
-  function createRoom() {
-    const code = generateCode();
-    setStatus('connecting', 'Creating room…');
-    dom.createBtn.disabled = true;
-    dom.joinBtn.disabled = true;
-    state.isHost = true;
-    state.roomCode = code;
+  /* ===== Pre-warmed host peer =====
+     Start opening a signaling connection as soon as the page loads, so that by
+     the time the user clicks "Create a room" the broker has already registered
+     the ID and we can enter the game instantly. If the user clicks "Join"
+     instead, we destroy the warm peer and start fresh. */
+  let warmPeer = null;
+  let warmCode = null;
+  let warmReady = false;
+  let warmStart = 0;
 
-    const peer = makePeer(PEER_PREFIX + code);
-    state.peer = peer;
-
-    peer.on('open', () => {
-      // Assign host's color up front (random)
-      state.myColor = Math.random() < 0.5 ? 'w' : 'b';
-      state.chess = new Chess();
-      state.gameOver = true; // locked until opponent joins
-      setStatus('connecting', `Room ${code} — waiting for opponent…`);
-      enterGame();
-      renderAll();
-      addSysMessage(`Room ${code} is live. Share the code with your opponent.`);
-      dom.roomCodeDisplay.textContent = code;
+  function startWarmPeer() {
+    warmCode = generateCode();
+    warmReady = false;
+    warmStart = performance.now();
+    const p = makePeer(PEER_PREFIX + warmCode);
+    warmPeer = p;
+    p.on('open', () => {
+      if (warmPeer === p) {
+        warmReady = true;
+        console.log(`[warm] ready in ${Math.round(performance.now() - warmStart)}ms`);
+      }
     });
+    p.on('error', (err) => {
+      if (warmPeer !== p) return;
+      if (err.type === 'unavailable-id') {
+        try { p.destroy(); } catch (e) {}
+        startWarmPeer();
+      } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
+        // Broker failed; clear warm, fall back to on-demand in createRoom
+        try { p.destroy(); } catch (e) {}
+        warmPeer = null;
+        warmReady = false;
+      }
+    });
+  }
 
+  // Kick off warm as soon as PeerJS lib is loaded
+  if (typeof Peer !== 'undefined') {
+    startWarmPeer();
+  } else {
+    window.addEventListener('load', () => { if (typeof Peer !== 'undefined') startWarmPeer(); });
+  }
+
+  function attachHostHandlers(peer, code) {
     peer.on('connection', (conn) => {
       if (state.conn) { conn.close(); return; } // only one opponent
       setupConnection(conn);
     });
-
     peer.on('error', (err) => {
       console.error('Peer error:', err);
+      if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
+        setStatus('error', 'Network error');
+        toast('Connection lost — try reloading.');
+      } else if (err.type !== 'peer-unavailable') {
+        setStatus('error', err.type || 'Error');
+      }
+    });
+    peer.on('disconnected', () => {
+      setStatus('connecting', 'Reconnecting…');
+      try { peer.reconnect(); } catch (e) {}
+    });
+  }
+
+  function onHostReady(peer, code) {
+    state.myColor = Math.random() < 0.5 ? 'w' : 'b';
+    state.chess = new Chess();
+    state.gameOver = true; // locked until opponent joins
+    setStatus('connecting', `Room ${code} — waiting for opponent…`);
+    enterGame();
+    renderAll();
+    addSysMessage(`Room ${code} is live. Share the code with your opponent.`);
+    dom.roomCodeDisplay.textContent = code;
+  }
+
+  function createRoom() {
+    dom.createBtn.disabled = true;
+    dom.joinBtn.disabled = true;
+    state.isHost = true;
+
+    // Use the pre-warmed peer if available
+    if (warmPeer && warmReady) {
+      state.peer = warmPeer;
+      state.roomCode = warmCode;
+      attachHostHandlers(warmPeer, warmCode);
+      onHostReady(warmPeer, warmCode);
+      // Don't retire warm: it IS the session peer now
+      return;
+    }
+    if (warmPeer && !warmReady) {
+      // Warm in progress — attach and wait
+      setStatus('connecting', 'Creating room…');
+      state.peer = warmPeer;
+      state.roomCode = warmCode;
+      attachHostHandlers(warmPeer, warmCode);
+      warmPeer.on('open', () => onHostReady(state.peer, state.roomCode));
+      return;
+    }
+
+    // No warm available (rare) — cold start
+    const code = generateCode();
+    state.roomCode = code;
+    setStatus('connecting', 'Creating room…');
+    const peer = makePeer(PEER_PREFIX + code);
+    state.peer = peer;
+    attachHostHandlers(peer, code);
+    peer.on('open', () => onHostReady(peer, code));
+    peer.on('error', (err) => {
       if (err.type === 'unavailable-id') {
         setStatus('error', 'Code collision — try again');
         dom.lobbyHint.textContent = 'That code is taken. Please try again.';
         dom.createBtn.disabled = false;
         dom.joinBtn.disabled = false;
         state.peer = null;
-      } else if (err.type === 'peer-unavailable') {
-        // handled at join
-      } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
-        setStatus('error', 'Network error');
-        toast('Connection lost — try reloading.');
-      } else {
-        setStatus('error', err.type || 'Error');
       }
     });
+  }
 
-    peer.on('disconnected', () => {
-      setStatus('connecting', 'Reconnecting…');
-      try { peer.reconnect(); } catch (e) {}
-    });
+  function disposeWarmPeer() {
+    if (warmPeer && warmPeer !== state.peer) {
+      try { warmPeer.destroy(); } catch (e) {}
+    }
+    warmPeer = null;
+    warmReady = false;
+    warmCode = null;
   }
 
   function joinRoom() {
@@ -194,6 +268,9 @@
     dom.joinBtn.disabled = true;
     state.isHost = false;
     state.roomCode = code;
+
+    // Joiner doesn't need the pre-warmed host peer; free it
+    disposeWarmPeer();
 
     const peer = makePeer(); // random id
     state.peer = peer;
