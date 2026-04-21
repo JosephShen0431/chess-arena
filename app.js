@@ -1,37 +1,42 @@
-/* Chess Arena — peer-to-peer multiplayer chess + chat
-   Uses chess.js for rules, PeerJS public broker for WebRTC signaling. */
+/* Chess Arena — MQTT-backed multiplayer chess + chat
+   Uses chess.js for rules, HiveMQ public MQTT broker for messaging.
+   MQTT connects in ~300-800ms (vs 3-10s for PeerJS broker), and we pre-warm
+   it on page load so the "Create a room" click is effectively instant. */
 
 (() => {
-  const PEER_PREFIX = 'claude-chess-arena-v2-';
+  const MQTT_URL = 'wss://broker.hivemq.com:8884/mqtt';
+  const TOPIC_BASE = 'claude-chess-arena-v3';
   const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const PIECE_UNICODE = {
-    p: '♟', n: '♞', b: '♝', r: '♜', q: '♛', k: '♚'
-  };
+  const PIECE_UNICODE = { p: '♟', n: '♞', b: '♝', r: '♜', q: '♛', k: '♚' };
   const PROMOTION_PIECES = ['q', 'r', 'b', 'n'];
+
+  const myClientId = 'c-' + Math.random().toString(36).slice(2, 14);
 
   /* ========= State ========= */
   const state = {
-    peer: null,
-    conn: null,
+    client: null,
+    topic: null,
+    peerId: null,           // opponent's client id (paired after hello/welcome)
     isHost: false,
     roomCode: null,
     myName: 'Anonymous',
     oppName: 'Opponent',
-    myColor: null,        // 'w' | 'b'
-    chess: null,          // chess.js instance
-    selected: null,       // square e.g. 'e2'
-    legalTargets: [],     // [{to, flags, capture}]
-    lastMove: null,       // {from, to}
-    pending: {            // pending UX flows
-      promotion: null,    // {from, to, resolve}
-      confirm: null,      // {resolve}
-      drawOffer: false,   // we offered draw, waiting
+    myColor: null,          // 'w' | 'b'
+    chess: null,
+    selected: null,
+    legalTargets: [],
+    lastMove: null,
+    pending: {
+      promotion: null,
+      confirm: null,
+      drawOffer: false,
       drawOfferedByOpp: false,
       rematchOffer: false,
       rematchOfferedByOpp: false,
     },
     gameOver: false,
-    history: [],          // SAN history mirrored for UI
+    history: [],
+    joinTimeoutId: null,
   };
 
   /* ========= DOM ========= */
@@ -67,16 +72,13 @@
     for (let i = 0; i < 6; i++) code += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
     return code;
   }
-
   function normalizeCode(raw) {
     return (raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
   }
-
   function setStatus(kind, text) {
     dom.status.className = 'status ' + kind;
     dom.statusText.textContent = text;
   }
-
   function toast(msg, ms = 2400) {
     const el = document.createElement('div');
     el.className = 'toast';
@@ -85,14 +87,11 @@
     setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity 0.3s'; }, ms - 300);
     setTimeout(() => el.remove(), ms);
   }
-
   function confirm(title, body) {
     dom.confirmTitle.textContent = title;
     dom.confirmBody.textContent = body;
     dom.confirmModal.classList.remove('hidden');
-    return new Promise((resolve) => {
-      state.pending.confirm = resolve;
-    });
+    return new Promise((resolve) => { state.pending.confirm = resolve; });
   }
   dom.confirmYes.addEventListener('click', () => {
     dom.confirmModal.classList.add('hidden');
@@ -102,254 +101,160 @@
     dom.confirmModal.classList.add('hidden');
     if (state.pending.confirm) { state.pending.confirm(false); state.pending.confirm = null; }
   });
-
   function beep(freq = 440, dur = 0.08) {
     try {
       const ctx = beep.ctx || (beep.ctx = new (window.AudioContext || window.webkitAudioContext)());
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.value = freq;
-      gain.gain.value = 0.05;
+      osc.type = 'sine'; osc.frequency.value = freq; gain.gain.value = 0.05;
       osc.connect(gain).connect(ctx.destination);
       osc.start();
       gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + dur);
       osc.stop(ctx.currentTime + dur);
-    } catch (e) { /* audio unavailable */ }
+    } catch (e) {}
+  }
+  function escapeHtml(s) {
+    return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
-  /* ========= PeerJS connection ========= */
-  function makePeer(id) {
-    return new Peer(id, {
-      debug: 1,
-      config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:global.stun.twilio.com:3478' },
-        ],
-      },
+  /* ========= MQTT transport ========= */
+  function initMqtt() {
+    if (!window.mqtt) {
+      setTimeout(initMqtt, 50);
+      return;
+    }
+    const t0 = performance.now();
+    state.client = mqtt.connect(MQTT_URL, {
+      clientId: myClientId,
+      clean: true,
+      keepalive: 30,
+      reconnectPeriod: 2000,
+      connectTimeout: 8000,
     });
-  }
-
-  /* ===== Pre-warmed host peer =====
-     Start opening a signaling connection as soon as the page loads, so that by
-     the time the user clicks "Create a room" the broker has already registered
-     the ID and we can enter the game instantly. If the user clicks "Join"
-     instead, we destroy the warm peer and start fresh. */
-  let warmPeer = null;
-  let warmCode = null;
-  let warmReady = false;
-  let warmStart = 0;
-
-  function startWarmPeer() {
-    warmCode = generateCode();
-    warmReady = false;
-    warmStart = performance.now();
-    const p = makePeer(PEER_PREFIX + warmCode);
-    warmPeer = p;
-    p.on('open', () => {
-      if (warmPeer === p) {
-        warmReady = true;
-        console.log(`[warm] ready in ${Math.round(performance.now() - warmStart)}ms`);
-      }
+    state.client.on('connect', () => {
+      console.log(`[mqtt] connected in ${Math.round(performance.now() - t0)}ms`);
+      setStatus('', 'Ready');
     });
-    p.on('error', (err) => {
-      if (warmPeer !== p) return;
-      if (err.type === 'unavailable-id') {
-        try { p.destroy(); } catch (e) {}
-        startWarmPeer();
-      } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
-        // Broker failed; clear warm, fall back to on-demand in createRoom
-        try { p.destroy(); } catch (e) {}
-        warmPeer = null;
-        warmReady = false;
-      }
-    });
-  }
-
-  // Kick off warm as soon as PeerJS lib is loaded
-  if (typeof Peer !== 'undefined') {
-    startWarmPeer();
-  } else {
-    window.addEventListener('load', () => { if (typeof Peer !== 'undefined') startWarmPeer(); });
-  }
-
-  function attachHostHandlers(peer, code) {
-    peer.on('connection', (conn) => {
-      if (state.conn) { conn.close(); return; } // only one opponent
-      setupConnection(conn);
-    });
-    peer.on('error', (err) => {
-      console.error('Peer error:', err);
-      if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
-        setStatus('error', 'Network error');
-        toast('Connection lost — try reloading.');
-      } else if (err.type !== 'peer-unavailable') {
-        setStatus('error', err.type || 'Error');
-      }
-    });
-    peer.on('disconnected', () => {
+    state.client.on('reconnect', () => {
       setStatus('connecting', 'Reconnecting…');
-      try { peer.reconnect(); } catch (e) {}
     });
-  }
-
-  function onHostReady(peer, code) {
-    state.myColor = Math.random() < 0.5 ? 'w' : 'b';
-    state.chess = new Chess();
-    state.gameOver = true; // locked until opponent joins
-    setStatus('connecting', `Room ${code} — waiting for opponent…`);
-    enterGame();
-    renderAll();
-    addSysMessage(`Room ${code} is live. Share the code with your opponent.`);
-    dom.roomCodeDisplay.textContent = code;
-  }
-
-  function createRoom() {
-    dom.createBtn.disabled = true;
-    dom.joinBtn.disabled = true;
-    state.isHost = true;
-
-    // Use the pre-warmed peer if available
-    if (warmPeer && warmReady) {
-      state.peer = warmPeer;
-      state.roomCode = warmCode;
-      attachHostHandlers(warmPeer, warmCode);
-      onHostReady(warmPeer, warmCode);
-      // Don't retire warm: it IS the session peer now
-      return;
-    }
-    if (warmPeer && !warmReady) {
-      // Warm in progress — attach and wait
-      setStatus('connecting', 'Creating room…');
-      state.peer = warmPeer;
-      state.roomCode = warmCode;
-      attachHostHandlers(warmPeer, warmCode);
-      warmPeer.on('open', () => onHostReady(state.peer, state.roomCode));
-      return;
-    }
-
-    // No warm available (rare) — cold start
-    const code = generateCode();
-    state.roomCode = code;
-    setStatus('connecting', 'Creating room…');
-    const peer = makePeer(PEER_PREFIX + code);
-    state.peer = peer;
-    attachHostHandlers(peer, code);
-    peer.on('open', () => onHostReady(peer, code));
-    peer.on('error', (err) => {
-      if (err.type === 'unavailable-id') {
-        setStatus('error', 'Code collision — try again');
-        dom.lobbyHint.textContent = 'That code is taken. Please try again.';
-        dom.createBtn.disabled = false;
-        dom.joinBtn.disabled = false;
-        state.peer = null;
-      }
+    state.client.on('error', (err) => {
+      console.error('[mqtt] error', err);
     });
-  }
-
-  function disposeWarmPeer() {
-    if (warmPeer && warmPeer !== state.peer) {
-      try { warmPeer.destroy(); } catch (e) {}
-    }
-    warmPeer = null;
-    warmReady = false;
-    warmCode = null;
-  }
-
-  function joinRoom() {
-    const code = normalizeCode(dom.joinCodeInput.value);
-    if (code.length !== 6) {
-      dom.lobbyHint.textContent = 'Enter a 6-character code.';
-      return;
-    }
+    state.client.on('close', () => {
+      if (state.topic) setStatus('connecting', 'Reconnecting…');
+    });
+    state.client.on('message', onMqttMessage);
     setStatus('connecting', 'Connecting…');
-    dom.createBtn.disabled = true;
-    dom.joinBtn.disabled = true;
-    state.isHost = false;
-    state.roomCode = code;
+  }
 
-    // Joiner doesn't need the pre-warmed host peer; free it
-    disposeWarmPeer();
+  function whenConnected() {
+    if (state.client && state.client.connected) return Promise.resolve();
+    return new Promise((resolve) => {
+      const h = () => { state.client.off('connect', h); resolve(); };
+      state.client.on('connect', h);
+    });
+  }
 
-    const peer = makePeer(); // random id
-    state.peer = peer;
-
-    peer.on('open', () => {
-      const conn = peer.connect(PEER_PREFIX + code, { reliable: true });
-      setupConnection(conn);
-      conn.on('open', () => {
-        send({ type: 'hello', name: state.myName });
+  function subscribeRoom(code) {
+    const topic = `${TOPIC_BASE}/${code}`;
+    state.topic = topic;
+    return whenConnected().then(() => new Promise((resolve) => {
+      state.client.subscribe(topic, { qos: 0 }, (err) => {
+        if (err) console.error('[mqtt] subscribe err', err);
+        resolve();
       });
+    }));
+  }
 
-      // Timeout if peer unreachable
-      setTimeout(() => {
-        if (!state.myColor && !state.gameOver) {
-          // still not connected
-          if (!conn.open) {
-            toast('Could not reach that room. Double-check the code.');
-            setStatus('error', 'Not connected');
-            dom.lobbyHint.textContent = 'Room not found or unreachable.';
-            dom.createBtn.disabled = false;
-            dom.joinBtn.disabled = false;
-            try { peer.destroy(); } catch (e) {}
-            state.peer = null;
-          }
-        }
-      }, 8000);
-    });
+  function unsubscribeRoom() {
+    if (state.topic && state.client) {
+      try { state.client.unsubscribe(state.topic); } catch (e) {}
+    }
+    state.topic = null;
+  }
 
-    peer.on('error', (err) => {
-      console.error('Peer error:', err);
-      if (err.type === 'peer-unavailable') {
-        dom.lobbyHint.textContent = 'Room not found. Check the code.';
-        setStatus('error', 'Room not found');
-        dom.createBtn.disabled = false;
-        dom.joinBtn.disabled = false;
-        try { peer.destroy(); } catch (e) {}
-        state.peer = null;
-      } else {
-        setStatus('error', err.type || 'Error');
+  function publish(obj) {
+    if (!state.client || !state.client.connected || !state.topic) return;
+    const msg = { ...obj, sender: myClientId };
+    try {
+      state.client.publish(state.topic, JSON.stringify(msg), { qos: 0 });
+    } catch (e) { console.error('publish', e); }
+  }
+
+  function onMqttMessage(topic, payload) {
+    if (topic !== state.topic) return;
+    let msg;
+    try { msg = JSON.parse(payload.toString()); } catch (e) { return; }
+    if (!msg || msg.sender === myClientId) return;
+
+    // Gate by peerId once paired. Before pairing, only 'hello' (host's view)
+    // or 'welcome' (guest's view) / 'full' can change pairing.
+    if (state.peerId && msg.sender !== state.peerId) {
+      // Host: reject extra joiners
+      if (state.isHost && msg.type === 'hello') {
+        // Respond directly so the third party knows the room is full
+        publishDirect({ type: 'full', to: msg.sender });
       }
-    });
+      return;
+    }
+
+    // Directed messages (e.g., 'welcome', 'full') — ensure this client is the target
+    if (msg.to && msg.to !== myClientId) return;
+
+    onAppMessage(msg);
   }
 
-  function setupConnection(conn) {
-    state.conn = conn;
-    conn.on('data', onMessage);
-    conn.on('close', onDisconnected);
-    conn.on('error', (err) => { console.error('Conn error:', err); });
+  // publish with an optional 'to' field — same topic, filtered by recipients
+  function publishDirect(obj) {
+    publish(obj);
   }
 
-  function send(msg) {
-    try { state.conn && state.conn.open && state.conn.send(msg); }
-    catch (e) { console.error('send failed', e); }
-  }
+  // Kick off MQTT connection as soon as library is available
+  window.addEventListener('load', initMqtt);
+  // Also try right away in case DOMContentLoaded -> load races fast
+  if (window.mqtt) initMqtt();
 
-  function onMessage(msg) {
-    if (!msg || typeof msg !== 'object') return;
+  /* ========= App message handling ========= */
+  function onAppMessage(msg) {
     switch (msg.type) {
-      case 'hello': // received by host
+      case 'hello': { // host receives from guest
+        if (!state.isHost) return;
+        if (state.peerId) return; // already paired
+        state.peerId = msg.sender;
         state.oppName = (msg.name || 'Opponent').slice(0, 20);
-        // Send welcome with assigned color (guest gets opposite of host)
         const guestColor = state.myColor === 'w' ? 'b' : 'w';
-        send({ type: 'welcome', name: state.myName, yourColor: guestColor });
+        publishDirect({ type: 'welcome', to: msg.sender, name: state.myName, yourColor: guestColor });
         startNewGame();
         setStatus('connected', 'Connected');
-        enterGame();
         addSysMessage(`${state.oppName} joined. Game on!`);
         break;
-      case 'welcome': // received by guest
+      }
+      case 'welcome': { // guest receives from host
+        if (state.isHost) return;
+        if (state.peerId) return;
+        state.peerId = msg.sender;
         state.oppName = (msg.name || 'Opponent').slice(0, 20);
         state.myColor = msg.yourColor;
+        if (state.joinTimeoutId) { clearTimeout(state.joinTimeoutId); state.joinTimeoutId = null; }
         startNewGame();
         setStatus('connected', 'Connected');
-        enterGame();
         addSysMessage(`Connected to ${state.oppName}. Game on!`);
         break;
-      case 'move':
-        applyOpponentMove(msg);
+      }
+      case 'full': {
+        if (state.isHost || state.peerId) return;
+        if (state.joinTimeoutId) { clearTimeout(state.joinTimeoutId); state.joinTimeoutId = null; }
+        setStatus('error', 'Room full');
+        toast('That room already has two players.');
+        dom.lobbyHint.textContent = 'Room is full.';
+        unsubscribeRoom();
+        dom.createBtn.disabled = false;
+        dom.joinBtn.disabled = false;
+        state.roomCode = null;
         break;
+      }
+      case 'move': applyOpponentMove(msg); break;
       case 'chat':
         addChatMessage('them', state.oppName, msg.text);
         beep(520, 0.04);
@@ -357,33 +262,74 @@
       case 'resign':
         endGame(`${state.oppName} resigned. You win.`, 'Resignation');
         break;
-      case 'draw-offer':
-        handleDrawOffer();
-        break;
-      case 'draw-accept':
-        endGame('Draw by agreement.', 'Draw');
-        break;
+      case 'draw-offer': handleDrawOffer(); break;
+      case 'draw-accept': endGame('Draw by agreement.', 'Draw'); break;
       case 'draw-decline':
         state.pending.drawOffer = false;
         addSysMessage(`${state.oppName} declined the draw.`);
         break;
-      case 'rematch-offer':
-        handleRematchOffer();
-        break;
+      case 'rematch-offer': handleRematchOffer(); break;
       case 'rematch-accept':
         state.myColor = msg.yourColor;
         startNewGame();
         addSysMessage('Rematch! New game started.');
         break;
+      case 'bye':
+        setStatus('error', 'Opponent disconnected');
+        addSysMessage('Opponent disconnected.');
+        toast('Opponent disconnected.');
+        state.gameOver = true;
+        renderAll();
+        break;
     }
   }
 
-  function onDisconnected() {
-    setStatus('error', 'Opponent disconnected');
-    addSysMessage('Opponent disconnected.');
-    toast('Opponent disconnected.');
+  /* ========= Room lifecycle ========= */
+  async function createRoom() {
+    const code = generateCode();
+    state.myName = (dom.nameInput.value.trim().slice(0, 20)) || 'Anonymous';
+    state.isHost = true;
+    state.roomCode = code;
+    state.myColor = Math.random() < 0.5 ? 'w' : 'b';
+    state.chess = new Chess();
     state.gameOver = true;
-    updateBoard();
+    dom.createBtn.disabled = true;
+    dom.joinBtn.disabled = true;
+    dom.lobbyHint.textContent = '';
+    // Show the room UI immediately; subscription happens in the background.
+    setStatus('connecting', `Room ${code} — waiting for opponent…`);
+    enterGame();
+    renderAll();
+    addSysMessage(`Room ${code} is live. Share the code with your opponent.`);
+    dom.roomCodeDisplay.textContent = code;
+    await subscribeRoom(code);
+  }
+
+  async function joinRoom() {
+    const code = normalizeCode(dom.joinCodeInput.value);
+    if (code.length !== 6) {
+      dom.lobbyHint.textContent = 'Enter a 6-character code.';
+      return;
+    }
+    state.myName = (dom.nameInput.value.trim().slice(0, 20)) || 'Anonymous';
+    state.isHost = false;
+    state.roomCode = code;
+    dom.createBtn.disabled = true;
+    dom.joinBtn.disabled = true;
+    dom.lobbyHint.textContent = '';
+    setStatus('connecting', 'Connecting…');
+    await subscribeRoom(code);
+    publish({ type: 'hello', name: state.myName });
+    state.joinTimeoutId = setTimeout(() => {
+      if (state.peerId) return;
+      setStatus('error', 'No host found');
+      toast('Nobody answered. Double-check the code.');
+      dom.lobbyHint.textContent = 'No host found for that code.';
+      unsubscribeRoom();
+      dom.createBtn.disabled = false;
+      dom.joinBtn.disabled = false;
+      state.roomCode = null;
+    }, 6000);
   }
 
   /* ========= Chess game ========= */
@@ -413,26 +359,22 @@
   }
 
   async function tryMakeMove(from, to) {
-    // Detect promotion
     const moves = state.chess.moves({ square: from, verbose: true });
     const candidate = moves.find(m => m.to === to);
     if (!candidate) return false;
-
-    let promotion = undefined;
+    let promotion;
     if (candidate.flags.includes('p')) {
       promotion = await askPromotion();
-      if (!promotion) return false; // cancelled
+      if (!promotion) return false;
     }
-
     const move = state.chess.move({ from, to, promotion });
     if (!move) return false;
-
     state.lastMove = { from: move.from, to: move.to };
     state.history.push(move);
     state.selected = null;
     state.legalTargets = [];
     beep(move.captured ? 340 : 500, 0.05);
-    send({ type: 'move', from: move.from, to: move.to, promotion });
+    publish({ type: 'move', from: move.from, to: move.to, promotion });
     renderAll();
     checkGameOver();
     return true;
@@ -442,20 +384,15 @@
     if (!state.chess.game_over()) return;
     let title = 'Game over', sub = '';
     if (state.chess.in_checkmate()) {
-      const loser = state.chess.turn(); // whose turn = who got mated
+      const loser = state.chess.turn();
       const winnerColor = loser === 'w' ? 'b' : 'w';
       const winnerIsMe = winnerColor === state.myColor;
       title = 'Checkmate';
       sub = winnerIsMe ? 'You win!' : `${state.oppName} wins.`;
-    } else if (state.chess.in_stalemate()) {
-      title = 'Stalemate'; sub = 'Draw.';
-    } else if (state.chess.insufficient_material()) {
-      title = 'Draw'; sub = 'Insufficient material.';
-    } else if (state.chess.in_threefold_repetition()) {
-      title = 'Draw'; sub = 'Threefold repetition.';
-    } else if (state.chess.in_draw()) {
-      title = 'Draw'; sub = '50-move rule.';
-    }
+    } else if (state.chess.in_stalemate()) { title = 'Stalemate'; sub = 'Draw.'; }
+    else if (state.chess.insufficient_material()) { title = 'Draw'; sub = 'Insufficient material.'; }
+    else if (state.chess.in_threefold_repetition()) { title = 'Draw'; sub = 'Threefold repetition.'; }
+    else if (state.chess.in_draw()) { title = 'Draw'; sub = '50-move rule.'; }
     endGame(sub || title, title);
   }
 
@@ -470,21 +407,15 @@
 
   /* ========= UI rendering ========= */
   function renderAll() {
-    renderPlayers();
-    renderBoard();
-    renderMoves();
-    renderCaptured();
+    renderPlayers(); renderBoard(); renderMoves(); renderCaptured();
     dom.roomCodeDisplay.textContent = state.roomCode || '——';
   }
 
   function renderPlayers() {
-    // top = opponent, bottom = me
     dom.topPlayer.querySelector('.player-name').textContent = state.oppName || 'Opponent';
     dom.bottomPlayer.querySelector('.player-name').textContent = (state.myName || 'You') + ' (you)';
-    const myInitial = (state.myName || '?').slice(0, 1).toUpperCase();
-    const oppInitial = (state.oppName || '?').slice(0, 1).toUpperCase();
-    dom.bottomPlayer.querySelector('.avatar').textContent = myInitial;
-    dom.topPlayer.querySelector('.avatar').textContent = oppInitial;
+    dom.bottomPlayer.querySelector('.avatar').textContent = (state.myName || '?').slice(0, 1).toUpperCase();
+    dom.topPlayer.querySelector('.avatar').textContent = (state.oppName || '?').slice(0, 1).toUpperCase();
   }
 
   function renderBoard() {
@@ -493,9 +424,7 @@
     const ranks = orientation === 'w' ? [8,7,6,5,4,3,2,1] : [1,2,3,4,5,6,7,8];
     const files = orientation === 'w' ? ['a','b','c','d','e','f','g','h'] : ['h','g','f','e','d','c','b','a'];
     const board = state.chess.board();
-    const myTurn = state.chess.turn() === state.myColor && !state.gameOver;
 
-    // In-check square
     let checkSquare = null;
     if (state.chess.in_check()) {
       const turn = state.chess.turn();
@@ -511,6 +440,7 @@
       }
     }
 
+    const myTurn = state.chess.turn() === state.myColor && !state.gameOver;
     const legalSet = new Set(state.legalTargets.map(m => m.to));
 
     let html = '';
@@ -536,7 +466,6 @@
         if (legalSet.has(square)) {
           inner += piece ? '<span class="ring-capture"></span>' : '<span class="dot-move"></span>';
         }
-        // Coordinates on edge squares
         if (fi === 0) inner += `<span class="coord rank">${rank}</span>`;
         if (ri === 7) inner += `<span class="coord file">${file}</span>`;
 
@@ -562,7 +491,6 @@
   }
 
   function renderCaptured() {
-    // Tally captured pieces from history
     const captured = { w: [], b: [] };
     for (const m of state.history) {
       if (m.captured) {
@@ -570,52 +498,34 @@
         captured[victimColor].push(m.captured);
       }
     }
-    // Show opponent's captures on my row (pieces I lost) and vice versa? Classic: show your captures (opp pieces you took) near you.
-    const myCaps = captured[state.myColor === 'w' ? 'b' : 'w']; // opp pieces I took
+    const myCaps = captured[state.myColor === 'w' ? 'b' : 'w'];
     const oppCaps = captured[state.myColor === 'w' ? 'w' : 'b'];
     dom.bottomCaptured.innerHTML = myCaps.map(t => `<span class="piece ${state.myColor === 'w' ? 'black' : 'white'}" style="font-size:16px">${PIECE_UNICODE[t]}</span>`).join(' ');
     dom.topCaptured.innerHTML = oppCaps.map(t => `<span class="piece ${state.myColor === 'w' ? 'white' : 'black'}" style="font-size:16px">${PIECE_UNICODE[t]}</span>`).join(' ');
   }
 
-  function updateBoard() { renderBoard(); }
-
   /* ========= Board interaction ========= */
   dom.board.addEventListener('click', (e) => {
     const sqEl = e.target.closest('.square');
     if (!sqEl) return;
-    const square = sqEl.dataset.sq;
-    onSquareClick(square);
+    onSquareClick(sqEl.dataset.sq);
   });
 
   function onSquareClick(square) {
     if (!state.chess || state.gameOver) return;
-    if (state.chess.turn() !== state.myColor) {
-      // Not our turn — allow selecting to preview? Keep it simple, ignore.
-      return;
-    }
+    if (state.chess.turn() !== state.myColor) return;
     const piece = state.chess.get(square);
 
     if (state.selected) {
-      // If clicking same square: deselect
       if (state.selected === square) {
-        state.selected = null;
-        state.legalTargets = [];
-        renderBoard();
-        return;
+        state.selected = null; state.legalTargets = []; renderBoard(); return;
       }
-      // If clicking own piece, reselect
-      if (piece && piece.color === state.myColor) {
-        selectSquare(square);
-        return;
-      }
-      // Else try move
+      if (piece && piece.color === state.myColor) { selectSquare(square); return; }
       const legal = state.legalTargets.find(m => m.to === square);
       if (legal) {
         tryMakeMove(state.selected, square);
       } else {
-        state.selected = null;
-        state.legalTargets = [];
-        renderBoard();
+        state.selected = null; state.legalTargets = []; renderBoard();
       }
     } else {
       if (piece && piece.color === state.myColor) selectSquare(square);
@@ -661,40 +571,36 @@
     dom.chatLog.appendChild(div);
     dom.chatLog.scrollTop = dom.chatLog.scrollHeight;
   }
-  function escapeHtml(s) {
-    return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  }
 
   dom.chatForm.addEventListener('submit', (e) => {
     e.preventDefault();
     const text = dom.chatInput.value.trim().slice(0, 300);
     if (!text) return;
-    if (!state.conn || !state.conn.open) { toast('Not connected.'); return; }
-    send({ type: 'chat', text });
+    if (!state.client || !state.client.connected) { toast('Not connected.'); return; }
+    publish({ type: 'chat', text });
     addChatMessage('me', state.myName, text);
     dom.chatInput.value = '';
   });
 
   /* ========= Game controls ========= */
   dom.resignBtn.addEventListener('click', async () => {
-    if (state.gameOver || !state.conn) return;
+    if (state.gameOver) return;
     const ok = await confirm('Resign?', 'Your opponent will win this game.');
     if (!ok) return;
-    send({ type: 'resign' });
+    publish({ type: 'resign' });
     endGame('You resigned.', 'Resignation');
   });
 
   dom.drawBtn.addEventListener('click', () => {
-    if (state.gameOver || !state.conn) return;
+    if (state.gameOver) return;
     if (state.pending.drawOfferedByOpp) {
-      // Accept pending offer
-      send({ type: 'draw-accept' });
+      publish({ type: 'draw-accept' });
       endGame('Draw by agreement.', 'Draw');
       return;
     }
     if (state.pending.drawOffer) { toast('Draw already offered.'); return; }
     state.pending.drawOffer = true;
-    send({ type: 'draw-offer' });
+    publish({ type: 'draw-offer' });
     addSysMessage('You offered a draw.');
     toast('Draw offered.');
   });
@@ -705,10 +611,10 @@
     const accept = await confirm('Draw offer', `${state.oppName} is offering a draw. Accept?`);
     state.pending.drawOfferedByOpp = false;
     if (accept) {
-      send({ type: 'draw-accept' });
+      publish({ type: 'draw-accept' });
       endGame('Draw by agreement.', 'Draw');
     } else {
-      send({ type: 'draw-decline' });
+      publish({ type: 'draw-decline' });
       addSysMessage('You declined the draw.');
     }
   }
@@ -717,13 +623,10 @@
   dom.newGameBtn.addEventListener('click', handleRematchClick);
 
   function handleRematchClick() {
-    if (!state.conn) return;
     if (state.pending.rematchOfferedByOpp) {
-      // Accept — opponent proposed, we respond with swapped colors
-      // Opponent's new color is opposite of whatever they had; since we don't track theirs, just swap ours
       const newColor = state.myColor === 'w' ? 'b' : 'w';
       const theirNewColor = newColor === 'w' ? 'b' : 'w';
-      send({ type: 'rematch-accept', yourColor: theirNewColor });
+      publish({ type: 'rematch-accept', yourColor: theirNewColor });
       state.myColor = newColor;
       state.pending.rematchOfferedByOpp = false;
       startNewGame();
@@ -732,7 +635,7 @@
     }
     if (state.pending.rematchOffer) { toast('Rematch offer pending.'); return; }
     state.pending.rematchOffer = true;
-    send({ type: 'rematch-offer' });
+    publish({ type: 'rematch-offer' });
     addSysMessage('You offered a rematch.');
     toast('Rematch offered.');
   }
@@ -744,7 +647,7 @@
     if (accept) {
       const newColor = state.myColor === 'w' ? 'b' : 'w';
       const theirNewColor = newColor === 'w' ? 'b' : 'w';
-      send({ type: 'rematch-accept', yourColor: theirNewColor });
+      publish({ type: 'rematch-accept', yourColor: theirNewColor });
       state.myColor = newColor;
       state.pending.rematchOfferedByOpp = false;
       startNewGame();
@@ -758,9 +661,13 @@
   dom.leaveBtn.addEventListener('click', async () => {
     const ok = await confirm('Leave game?', 'This will disconnect you from the room.');
     if (!ok) return;
-    if (state.conn) try { state.conn.close(); } catch (e) {}
-    if (state.peer) try { state.peer.destroy(); } catch (e) {}
+    try { publish({ type: 'bye' }); } catch (e) {}
+    unsubscribeRoom();
     location.reload();
+  });
+
+  window.addEventListener('beforeunload', () => {
+    try { publish({ type: 'bye' }); } catch (e) {}
   });
 
   dom.copyCodeBtn.addEventListener('click', async () => {
@@ -781,18 +688,9 @@
     });
   });
 
-  /* ========= Lobby actions ========= */
-  dom.createBtn.addEventListener('click', () => {
-    state.myName = (dom.nameInput.value.trim().slice(0, 20)) || 'Anonymous';
-    dom.lobbyHint.textContent = '';
-    createRoom();
-  });
-
-  dom.joinBtn.addEventListener('click', () => {
-    state.myName = (dom.nameInput.value.trim().slice(0, 20)) || 'Anonymous';
-    dom.lobbyHint.textContent = '';
-    joinRoom();
-  });
+  /* ========= Lobby ========= */
+  dom.createBtn.addEventListener('click', createRoom);
+  dom.joinBtn.addEventListener('click', joinRoom);
 
   dom.joinCodeInput.addEventListener('input', (e) => {
     e.target.value = normalizeCode(e.target.value);
@@ -809,7 +707,6 @@
     dom.game.classList.remove('hidden');
   }
 
-  // URL ?room=XXXXXX pre-fills join code
   const params = new URLSearchParams(location.search);
   const urlRoom = normalizeCode(params.get('room') || '');
   if (urlRoom.length === 6) {
@@ -817,12 +714,11 @@
     dom.joinCodeInput.focus();
   }
 
-  // Persist name
   const savedName = localStorage.getItem('chess-arena-name');
   if (savedName) dom.nameInput.value = savedName;
   dom.nameInput.addEventListener('change', () => {
     localStorage.setItem('chess-arena-name', dom.nameInput.value.slice(0, 20));
   });
 
-  setStatus('', 'Not connected');
+  setStatus('connecting', 'Connecting…');
 })();
