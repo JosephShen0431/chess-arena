@@ -151,7 +151,7 @@
   function whenConnected() {
     if (state.client && state.client.connected) return Promise.resolve();
     return new Promise((resolve) => {
-      const h = () => { state.client.off('connect', h); resolve(); };
+      const h = () => { state.client.removeListener('connect', h); resolve(); };
       state.client.on('connect', h);
     });
   }
