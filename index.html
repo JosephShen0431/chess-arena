@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Chess Arena — Play Live Online</title>
+<meta name="description" content="Create a room, share the code, and play chess with anyone in the world. No signup, no backend — peer-to-peer.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%99%9E%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="top-bar">
+  <div class="brand">
+    <span class="logo">♞</span>
+    <span class="title">Chess Arena</span>
+  </div>
+  <div class="status" id="status">
+    <span class="dot" id="statusDot"></span>
+    <span id="statusText">Not connected</span>
+  </div>
+</header>
+
+<!-- LOBBY -->
+<section id="lobby" class="lobby">
+  <div class="lobby-card">
+    <h1>Play chess with anyone, anywhere</h1>
+    <p class="subtitle">Create a room, share the 6-character code, and play. Runs peer-to-peer in your browser — no account, no server.</p>
+
+    <label class="field">
+      <span>Your name</span>
+      <input id="nameInput" type="text" maxlength="20" placeholder="Anonymous" autocomplete="off">
+    </label>
+
+    <div class="lobby-actions">
+      <button id="createBtn" class="btn primary">Create a room</button>
+      <div class="or">or</div>
+      <div class="join-row">
+        <input id="joinCodeInput" type="text" maxlength="6" placeholder="ENTER CODE" autocomplete="off" spellcheck="false">
+        <button id="joinBtn" class="btn">Join</button>
+      </div>
+    </div>
+
+    <p class="hint" id="lobbyHint"></p>
+    <div class="features">
+      <div class="feat"><b>Live chat</b><span>while you play</span></div>
+      <div class="feat"><b>Move list</b><span>full history in SAN</span></div>
+      <div class="feat"><b>No backend</b><span>direct WebRTC</span></div>
+      <div class="feat"><b>Draw / resign</b><span>offer, accept, decline</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- GAME -->
+<section id="game" class="game hidden">
+  <div class="game-left">
+    <div class="player-row" id="topPlayer">
+      <div class="avatar">?</div>
+      <div class="player-info">
+        <div class="player-name">Opponent</div>
+        <div class="captured" id="topCaptured"></div>
+      </div>
+    </div>
+
+    <div class="board-wrap">
+      <div class="board" id="board" aria-label="Chess board"></div>
+      <div class="result-overlay hidden" id="resultOverlay">
+        <div class="result-card">
+          <div class="result-title" id="resultTitle">Checkmate</div>
+          <div class="result-sub" id="resultSub"></div>
+          <button class="btn primary" id="newGameBtn">Offer rematch</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="player-row" id="bottomPlayer">
+      <div class="avatar">?</div>
+      <div class="player-info">
+        <div class="player-name">You</div>
+        <div class="captured" id="bottomCaptured"></div>
+      </div>
+    </div>
+
+    <div class="game-controls">
+      <button id="resignBtn" class="btn small">Resign</button>
+      <button id="drawBtn" class="btn small">Offer draw</button>
+      <button id="rematchBtn" class="btn small">Rematch</button>
+      <button id="copyCodeBtn" class="btn small ghost" title="Copy room code">Room: <b id="roomCodeDisplay">——</b></button>
+      <button id="leaveBtn" class="btn small ghost">Leave</button>
+    </div>
+  </div>
+
+  <aside class="sidebar">
+    <div class="tabs">
+      <button class="tab active" data-tab="chat">Chat</button>
+      <button class="tab" data-tab="moves">Moves</button>
+    </div>
+
+    <div class="tab-panel" data-panel="chat">
+      <div class="chat-log" id="chatLog"></div>
+      <form class="chat-form" id="chatForm">
+        <input id="chatInput" type="text" maxlength="300" placeholder="Say something..." autocomplete="off">
+        <button class="btn primary small" type="submit">Send</button>
+      </form>
+    </div>
+
+    <div class="tab-panel hidden" data-panel="moves">
+      <div class="moves-log" id="movesLog"></div>
+    </div>
+  </aside>
+</section>
+
+<!-- PROMOTION MODAL -->
+<div class="modal hidden" id="promotionModal">
+  <div class="modal-card">
+    <div class="modal-title">Promote pawn</div>
+    <div class="promotion-choices" id="promotionChoices"></div>
+  </div>
+</div>
+
+<!-- CONFIRM / NOTIFY MODAL -->
+<div class="modal hidden" id="confirmModal">
+  <div class="modal-card">
+    <div class="modal-title" id="confirmTitle"></div>
+    <div class="modal-body" id="confirmBody"></div>
+    <div class="modal-actions">
+      <button class="btn" id="confirmNo">No</button>
+      <button class="btn primary" id="confirmYes">Yes</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.13.4/chess.min.js"></script>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
