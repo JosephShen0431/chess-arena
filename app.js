@@ -4,7 +4,7 @@
    it on page load so the "Create a room" click is effectively instant. */
 
 (() => {
-  const MQTT_URL = 'wss://broker.hivemq.com:8884/mqtt';
+  const MQTT_URL = 'wss://broker.emqx.io:8084/mqtt';
   const TOPIC_BASE = 'claude-chess-arena-v3';
   const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const PIECE_UNICODE = { p: '♟', n: '♞', b: '♝', r: '♜', q: '♛', k: '♚' };
